@@ -1,7 +1,7 @@
 package org.shahe.tatu
 package chip.mmu
 import chisel3._
-import chip.common.{TatuBundle, TatuModule}
+import org.shahe.tatu.chip.common.{TatuBundle, TatuModule}
 
 import chisel3.util._
 import peripheral.bus.{AXI4LiteBundle, AXI4LiteMasterModule, AXI4LiteReadData, AXI4LiteWRiteRespType}
@@ -60,10 +60,8 @@ class TransUnitBundle extends TatuBundle {
 }
 
 class TransUnitTransfer extends AXI4LiteMasterModule {
-    override val io = IO(new Bundle {
-        val axi = new AXI4LiteBundle
-        val xb = new TransferBundle
-    })
+    // we already have io
+    val xb = IO(new TransferBundle) // Transfer(X) Bundle
 
     val sIdle :: sReq :: sWait :: Nil = Enum(3)
 
@@ -73,14 +71,14 @@ class TransUnitTransfer extends AXI4LiteMasterModule {
     io.axi.ar.bits := DontCare
     io.axi.r.ready := false.B
 
-    io.xb.readData.valid := false.B
-    io.xb.readData.bits.data := 0.U
-    io.xb.readData.bits.resp := 0.U
+    xb.readData.valid := false.B
+    xb.readData.bits.data := 0.U
+    xb.readData.bits.resp := 0.U
 
     switch(state) {
         is(sIdle) {
-            when (io.xb.start) {
-                sendReadAddr(io.xb.addr)
+            when (xb.start) {
+                sendReadAddr(xb.addr)
                 state := sReq
             }
         }
@@ -92,7 +90,7 @@ class TransUnitTransfer extends AXI4LiteMasterModule {
         is(sWait) {
             io.axi.r.ready := true.B
             when(io.axi.r.valid) {
-                io.xb.readData <> io.axi.r
+                xb.readData <> io.axi.r
                 state := sIdle
             }
         }
@@ -238,9 +236,6 @@ class TransUnit extends TatuModule {
             }
         }
         is(sDone) {
-            // TODO:
-            // TODO:
-            // TODO:
             // check translation valid
             when(translation_valid) {
                 val lvec = lvPte.asTypeOf(new Sv39PTE)
@@ -248,7 +243,7 @@ class TransUnit extends TatuModule {
                 io.exception := Mux(isSv39, MuxCase(PageFaultExceptType.success, Array(
                     (!lvec.x && reqOp === MemReqOp.x) -> PageFaultExceptType.ipf,
                     (!lvec.r && reqOp === MemReqOp.r) -> PageFaultExceptType.lpf,
-                    (!lvec.w && reqOp === MemReqOp.w) -> PageFaultExceptType.sapf
+                    (!lvec.w && reqOp === MemReqOp.w) -> PageFaultExceptType.sapf,
                 )), PageFaultExceptType.success)
                 io.resp.valid := Mux(isSv39, PageFaultExceptType.success, io.exception === PageFaultExceptType.success)
             }.otherwise {
