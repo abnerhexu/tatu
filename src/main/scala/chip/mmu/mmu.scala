@@ -7,17 +7,17 @@ import chisel3.util._
 import peripheral.bus.{AXI4LiteBundle, AXI4LiteMasterModule, AXI4LiteReadData, AXI4LiteWRiteRespType}
 
 class Sv39PTE extends TatuBundle {
-    val v = Bool()
-    val r = Bool()
-    val w = Bool()
-    val x = Bool()
-    val u = Bool()
-    val g = Bool()
-    val a = Bool()
-    val d = Bool()
-    val rsw = UInt(2.W)
-    val ppn = UInt(44.W)
     val reserved = UInt(10.W)
+    val ppn = UInt(44.W)
+    val rsw = UInt(2.W)
+    val d = Bool()
+    val a = Bool()
+    val g = Bool()
+    val u = Bool()
+    val x = Bool()
+    val w = Bool()
+    val r = Bool()
+    val v = Bool()
 }
 
 object MemReqOp {
@@ -42,225 +42,226 @@ class TransUnitReqBundle extends TatuBundle {
 
 class TransUnitRespBundle extends TatuBundle {
     val pa = UInt(addrWidth.W)
+    val exception = Output(UInt(PageFaultExceptType.width.W))
 }
 
 class TransferBundle extends TatuBundle {
-    val addr = Input(UInt(addrWidth.W))
+    val addr = Flipped(Decoupled(UInt(addrWidth.W)))
     val readData = Decoupled(new AXI4LiteReadData)
-    val start = Input(Bool())
 }
 
 class TransUnitBundle extends TatuBundle {
-    val req = Flipped(Decoupled(new TransUnitReqBundle))
-    val resp = Valid(new TransUnitRespBundle)
     val abort = Input(Bool())
     val satp = Input(UInt(dataWidth.W))
-    val exception = Output(UInt(PageFaultExceptType.width.W))
+    val req = Flipped(Decoupled(new TransUnitReqBundle))
+    val resp = Decoupled(new TransUnitRespBundle)
     val xb = new TransferBundle
 }
 
 class TransUnitTransfer extends AXI4LiteMasterModule {
     // we already have io
-    val xb = IO(new TransferBundle) // Transfer(X) Bundle
-
+    val xio = IO(new Bundle {
+        val abort = Input(Bool())
+        val xb = new TransferBundle // Transfer(X) Bundle
+    })
+    
+    
     val sIdle :: sReq :: sWait :: Nil = Enum(3)
 
     val state = RegInit(sIdle)
+    val addrReg = Reg(UInt(addrWidth.W))
 
+    // default signals
     io.axi.ar.valid := false.B
-    io.axi.ar.bits := DontCare
+    io.axi.ar.bits.addr := addrReg
+    io.axi.ar.bits.prot := 0.U
     io.axi.r.ready := false.B
 
-    xb.readData.valid := false.B
-    xb.readData.bits.data := 0.U
-    xb.readData.bits.resp := 0.U
+    xio.xb.readData.valid := false.B
+    xio.xb.readData.bits.data := io.axi.r.bits.data
+    xio.xb.readData.bits.resp := io.axi.r.bits.resp
+    xio.xb.addr.ready := (state === sIdle)
 
     switch(state) {
         is(sIdle) {
-            when (xb.start) {
-                sendReadAddr(xb.addr)
-                state := sReq
+            when(xio.abort) {
+                state := sIdle
+            }.otherwise {
+                when(xio.xb.addr.valid) {
+                    addrReg := xio.xb.addr.bits
+                    state := sReq
+                }
             }
         }
         is(sReq) {
-            when (io.axi.ar.ready) {
-                state := sWait
+            // keep the signals for axi4-lite
+            when(xio.abort) {
+                state := sIdle
+            }.otherwise {
+                io.axi.ar.valid := true.B
+                when(io.axi.ar.fire) {
+                    state := sWait
+                }
             }
         }
         is(sWait) {
             io.axi.r.ready := true.B
-            when(io.axi.r.valid) {
-                xb.readData <> io.axi.r
-                state := sIdle
+            when(xio.abort) {
+                when(io.axi.r.fire) {
+                    state := sIdle
+                }
+            }.otherwise {
+                when(io.axi.r.fire) {
+                    xio.xb.readData.valid := true.B
+                    when (xio.xb.readData.fire) {
+                        state := sIdle
+                    }
+                }
             }
         }
     }
 }
 
 class TransUnit extends TatuModule {
+    // state machine states
+    val sIdle :: sReq :: sWait :: sCheck :: sDone :: Nil = Enum(5)
+
     val io = IO(new TransUnitBundle)
-    val va = io.req.bits.va
-    val reqOp = io.req.bits.reqOp
-    val satp = io.satp // satp(63, 60) should be 8.U since we only support Sv39
-    // TODO: do not use magic literal numbers
-    val isSv39 = (satp(63, 60) === 8.U)
-    val basePPN = satp(43, 0)
 
-    val vpns = VecInit(va(20, 12), va(29, 21), va(38, 30))
-    val pageOffset = va(11, 0)
-
-    def MkPteAddr(ppn: UInt, index: UInt): UInt = {
-        val pa = Cat(ppn, index, 0.U(3.W))
-        pa
-    }
-
-    val l2Pte = Reg(UInt(addrWidth.W))
-    val l1Pte = Reg(UInt(addrWidth.W))
-    val l0Pte = Reg(UInt(addrWidth.W))
-    val lvPte = Reg(UInt(addrWidth.W)) // last encountered (valid) PTE
-    val AXIReadResp = RegInit(0.U(AXI4LiteWRiteRespType.width.W))
-
-    val sIdle :: sL2Req :: sL2Wait :: sL1Req :: sL1Wait :: sL0Req :: sL0Wait :: sDone :: Nil = Enum(8)
+    // registers
     val state = RegInit(sIdle)
-    val pa = Reg(UInt(addrWidth.W))
-    val translation_valid = RegInit(false.B)
-    val translation_excpt = RegInit(PageFaultExceptType.success)
+    val reqReg = Reg(new TransUnitReqBundle)
+    val satpReg = Reg(UInt(dataWidth.W))
+    val pteReg = Reg(new Sv39PTE)
+    val level = Reg(UInt(2.W)) // Sv has 2, 1, 0 PTEs
+    val exceptionType = RegInit(PageFaultExceptType.success)
+    val finalPhyaddr = Reg(UInt(addrWidth.W))
+    
+    // satp info
+    val satpMode = satpReg(63, 60)
+    val isSv39 = (satpMode === 8.U)
+    val basePPN = satpReg(43, 0)
+
+    val vpn = VecInit(reqReg.va(20, 12), reqReg.va(29, 21), reqReg.va(38, 30))
+    val pageOffset = reqReg.va(11, 0)
+
+    // default signals
+    io.req.ready := (state === sIdle)
+    io.resp.valid := (state === sDone)
+    io.resp.bits := DontCare
+    io.xb.addr.valid := false.B
+    io.xb.addr.bits := 0.U
+    io.xb.readData.ready := true.B
+
+    def throwPageFault(op: UInt): UInt = {
+        MuxLookup(op, PageFaultExceptType.ipf)(Seq(
+            MemReqOp.r -> PageFaultExceptType.lpf,
+            MemReqOp.w -> PageFaultExceptType.sapf,
+            MemReqOp.x -> PageFaultExceptType.ipf
+        ))
+    }
 
     switch(state) {
         is(sIdle) {
-            // AXI4-Lite transfer module
-            io.xb.addr := DontCare
-            io.xb.start := false.B
-            io.exception := PageFaultExceptType.success
-            io.resp.valid := false.B
-            when(!isSv39) {
-                // bare metal, Sv39 not enabled
-                pa := va
-                translation_valid := true.B
-                state := sDone
+            when(io.req.fire) {
+                reqReg := io.req.bits
+                // TODO: do not need to read satp every time
+                satpReg := io.satp
+                exceptionType := PageFaultExceptType.success
+
+                when(satpMode === 0.U) {
+                    finalPhyaddr := io.req.bits.va
+                    state := sDone
+                }.elsewhen(satpMode === 8.U) {
+                    level := 2.U
+                    state := sReq
+                }.otherwise {
+                    exceptionType := throwPageFault(io.req.bits.reqOp)
+                    state := sDone
+                }
+            }
+        }
+        is(sReq) {
+            val currentBase = Mux(state === sReq && level === 2.U, basePPN, pteReg.ppn)
+            val pteAddr = Cat(currentBase, vpn(level), 0.U(3.W))
+
+            io.xb.addr.valid := true.B
+            io.xb.addr.bits := pteAddr
+
+            when(io.xb.addr.fire) {
+                state := sWait
+            }
+        }
+
+        is(sWait) {
+            when(io.xb.readData.valid) {
+                val pte = io.xb.readData.bits.data.asTypeOf(new Sv39PTE)
+                pteReg := pte
+                // check valid and axi error
+                when(!pte.v || io.xb.readData.bits.resp =/= 0.U) {
+                    exceptionType := throwPageFault(reqReg.reqOp)
+                    state := sDone
+                }.otherwise {
+                    state := sCheck
+                }
+            }
+        }
+
+        is(sCheck) {
+            val isLeaf = pteReg.r || pteReg.w || pteReg.x
+            when(isLeaf) {
+                when(level === 0.U) {
+                    exceptionType := throwPageFault(reqReg.reqOp)
+                    state := sDone
+                }.otherwise {
+                    level := level - 1.U
+                    state := sReq
+                }
             }.otherwise {
-                when(io.req.valid) {
-                    state := sL2Req
-                }.otherwise {
-                    state := sIdle
-                }
-            }
-        }
-        is(sL2Req) {
-            val l2PteAddr = MkPteAddr(basePPN, vpns(2))
-            io.xb.addr := l2PteAddr
-            io.xb.start := true.B
-            state := sL2Wait
-        }
-        is(sL2Wait) {
-            when(io.xb.readData.valid) {
-                val respData = io.xb.readData.bits.data
-                val l2ec = respData.asTypeOf(new Sv39PTE) // l2 entry content
-                lvPte := respData // last encountered PTE
-                when(!l2ec.v || (io.xb.readData.bits.resp =/= 0.U)) {
-                    // throw exception if the entry is not valid,
-                    // or readData response status is not zero (ok)
-                    translation_valid := false.B
-                    state := sDone
-                }.elsewhen(l2ec.r || l2ec.w || l2ec.x) {
-                    // check if super page, vpn(1), vpn(0) should be 0
-                    when(vpns(1) =/= 0.U || vpns(0) =/= 0.U) {
-                        translation_valid := false.B
-                    }.otherwise {
-                        // super page
-                        translation_valid := true.B
-                        pa := Cat(l2ec.ppn, pageOffset)
-                    }
-                    state := sDone
-                }.otherwise {
-                    l2Pte := respData
-                    AXIReadResp := io.xb.readData.bits.resp
-                    state := sL1Req
-                }
-            }
-            // otherwise, keep in sL2Wait
-        }
-        is(sL1Req) {
-            val l2ec = l2Pte.asTypeOf(new Sv39PTE)
-            val l1PteAddr = MkPteAddr(l2ec.ppn, vpns(1))
-            io.xb.addr := l1PteAddr
-            io.xb.start := true.B
-            state := sL1Wait
-        }
-        is(sL1Wait) {
-            when(io.xb.readData.valid) {
-                val respData = io.xb.readData.bits.data
-                val l1ec = respData.asTypeOf(new Sv39PTE)
-                lvPte := respData
-                when(!l1ec.v || (io.xb.readData.bits.resp =/= 0.U)) {
-                    translation_valid := false.B
-                    state := sDone
-                }.elsewhen(l1ec.r || l1ec.w || l1ec.x){
-                    when(vpns(0) =/= 0.U) {
-                        translation_valid := false.B
-                    }.otherwise {
-                        translation_valid := true.B
-                        pa := Cat(l1ec.ppn, pageOffset)
-                    }
-                }.otherwise {
-                    l1Pte := respData
-                    AXIReadResp := io.xb.readData.bits.resp
-                    state := sL0Req
-                }
-            }
-        }
-        is(sL0Req) {
-            val l1ec = l1Pte.asTypeOf(new Sv39PTE)
-            val l0PteAddr = MkPteAddr(l1ec.ppn, vpns(0))
-            io.xb.addr := l0PteAddr
-            io.xb.start := true.B
-            state := sL0Wait
-        }
-        is(sL0Wait) {
-            when(io.xb.readData.valid) {
-                val respData = io.xb.readData.bits.data
-                val l0ec = respData.asTypeOf(new Sv39PTE)
-                lvPte := respData
-                when(!l0ec.v || io.xb.readData.bits.resp =/= 0.U) {
-                    io.exception := true.B
-                    translation_valid := false.B
-                }.otherwise {
-                    // addr translation success
-                    l0Pte := respData
-                    AXIReadResp := io.xb.readData.bits.resp
-                    pa := Cat(l0ec.ppn, pageOffset)
-                    translation_valid := true.B
-                }
-                // no matter success of failed, goto sDone
-                state := sDone
-            }
-        }
-        is(sDone) {
-            // check translation valid
-            when(translation_valid) {
-                val lvec = lvPte.asTypeOf(new Sv39PTE)
-                // check lvPte and if not Sv39 simply do not check any privilege
-                io.exception := Mux(isSv39, MuxCase(PageFaultExceptType.success, Array(
-                    (!lvec.x && reqOp === MemReqOp.x) -> PageFaultExceptType.ipf,
-                    (!lvec.r && reqOp === MemReqOp.r) -> PageFaultExceptType.lpf,
-                    (!lvec.w && reqOp === MemReqOp.w) -> PageFaultExceptType.sapf,
-                )), PageFaultExceptType.success)
-                io.resp.valid := Mux(isSv39, PageFaultExceptType.success, io.exception === PageFaultExceptType.success)
-            }.otherwise {
-                io.resp.valid := false.B
-                // set io.exception if translation invalid
-                io.exception := MuxLookup(reqOp, PageFaultExceptType.ipf)(Seq(
-                    MemReqOp.r -> PageFaultExceptType.lpf,
-                    MemReqOp.w -> PageFaultExceptType.sapf,
-                    MemReqOp.x -> PageFaultExceptType.ipf
+                val privFault = 0.U
+                // (a) privilege invalid combination check
+                val invalidPrivComb = (!pteReg.r && pteReg.w)
+                val accessDeny = MuxLookup(reqReg.reqOp, true.B)(Seq(
+                    MemReqOp.r -> !pteReg.r,
+                    MemReqOp.w -> !pteReg.w,
+                    MemReqOp.x -> !pteReg.x
                 ))
+                // (b) check A/D. If not set, trigger pagefault. Software handles.
+                val adFault = !pteReg.a || (reqReg.reqOp === MemReqOp.w && !pteReg.d)
+                val misAligned = Mux(level === 2.U, pteReg.ppn(17, 0) =/= 0.U, Mux(
+                    level === 1.U, pteReg.ppn(8, 0) =/= 0.U, false.B
+                ))
+
+                when(invalidPrivComb || accessDeny || adFault || misAligned) {
+                    exceptionType := throwPageFault(reqReg.reqOp)
+                }.otherwise {
+                    val finalPPN = MuxLookup(level, pteReg.ppn)(Seq(
+                        2.U -> Cat(pteReg.ppn(43, 18), vpn(1), vpn(0)),
+                        1.U -> Cat(pteReg.ppn(43, 9), vpn(0)),
+                        0.U -> pteReg.ppn
+                    ))
+                    finalPhyaddr := Cat(finalPPN, pageOffset)
+                    exceptionType := PageFaultExceptType.success
+                }
+                state := sDone
             }
-            // check privilege info
+        }
 
-            io.resp.bits.pa := pa
-
-            state := sIdle
+        is(sDone) {
+            io.resp.bits.pa := finalPhyaddr
+            io.resp.bits.exception := exceptionType
+            when(io.resp.fire) {
+                state := sIdle
+            }
         }
     }
 
+    when(io.abort) {
+        state := sIdle
+        exceptionType := PageFaultExceptType.success
+        io.req.ready := false.B
+        io.resp.valid := false.B
+        io.xb.addr.valid := false.B
+        io.xb.readData.ready := false.B
+    }
 }

@@ -11,3 +11,5 @@
 .metals/
 project/
 target/
+
+sbt-launch.jar
