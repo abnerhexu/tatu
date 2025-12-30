@@ -5,6 +5,7 @@ import org.shahe.tatu.chip.common.{TatuBundle, TatuModule}
 
 import chisel3.util._
 import peripheral.bus.{AXI4LiteBundle, AXI4LiteMasterModule, AXI4LiteReadData, AXI4LiteWRiteRespType}
+import org.shahe.tatu.chip.csr.PrivStateType
 
 class Sv39PTE extends TatuBundle {
     val reserved = UInt(10.W)
@@ -53,6 +54,7 @@ class TransferBundle extends TatuBundle {
 class TransUnitBundle extends TatuBundle {
     val abort = Input(Bool())
     val satp = Input(UInt(dataWidth.W))
+    val priv = Input(UInt(PrivStateType.width.W))
     val req = Flipped(Decoupled(new TransUnitReqBundle))
     val resp = Decoupled(new TransUnitRespBundle)
     val xb = new TransferBundle
@@ -142,6 +144,15 @@ class TransUnit extends TatuModule {
     val isSv39 = (satpMode === 8.U)
     val basePPN = satpReg(43, 0)
 
+    // privilege info
+    val isPrivU = (io.priv === PrivStateType.user)
+
+    // check if vaddr meets imm extension
+    // TODO: remove magic numbers
+    val vaHighBits = reqReg.va(63, 39)
+    val vaSignBit = reqReg.va(38)
+    val vaAddrLegal = (vaHighBits === Fill(25, vaSignBit))
+
     val vpn = VecInit(reqReg.va(20, 12), reqReg.va(29, 21), reqReg.va(38, 30))
     val pageOffset = reqReg.va(11, 0)
 
@@ -168,13 +179,19 @@ class TransUnit extends TatuModule {
                 // TODO: do not need to read satp every time
                 satpReg := io.satp
                 exceptionType := PageFaultExceptType.success
-
-                when(satpMode === 0.U) {
+                // If do not enable paged memory (initial),
+                // or the privilege is M, then pa = va
+                when(satpMode === 0.U || !isPrivU) {
                     finalPhyaddr := io.req.bits.va
                     state := sDone
                 }.elsewhen(satpMode === 8.U) {
-                    level := 2.U
-                    state := sReq
+                    when(!vaAddrLegal) {
+                        exceptionType := throwPageFault(io.req.bits.reqOp)
+                        state := sDone
+                    }.otherwise {
+                        level := 2.U
+                        state := sReq
+                    }
                 }.otherwise {
                     exceptionType := throwPageFault(io.req.bits.reqOp)
                     state := sDone
@@ -182,7 +199,7 @@ class TransUnit extends TatuModule {
             }
         }
         is(sReq) {
-            val currentBase = Mux(state === sReq && level === 2.U, basePPN, pteReg.ppn)
+            val currentBase = Mux(level === 2.U, basePPN, pteReg.ppn)
             val pteAddr = Cat(currentBase, vpn(level), 0.U(3.W))
 
             io.xb.addr.valid := true.B
@@ -209,7 +226,7 @@ class TransUnit extends TatuModule {
 
         is(sCheck) {
             val isLeaf = pteReg.r || pteReg.w || pteReg.x
-            when(isLeaf) {
+            when(!isLeaf) {
                 when(level === 0.U) {
                     exceptionType := throwPageFault(reqReg.reqOp)
                     state := sDone
@@ -220,7 +237,9 @@ class TransUnit extends TatuModule {
             }.otherwise {
                 val privFault = 0.U
                 // (a) privilege invalid combination check
-                val invalidPrivComb = (!pteReg.r && pteReg.w)
+                // (a.1) w but not readable
+                // (a.2) under U privilege but pte.u is zero
+                val invalidPrivComb = (!pteReg.r && pteReg.w) || (isPrivU && !pteReg.u)
                 val accessDeny = MuxLookup(reqReg.reqOp, true.B)(Seq(
                     MemReqOp.r -> !pteReg.r,
                     MemReqOp.w -> !pteReg.w,
@@ -228,6 +247,7 @@ class TransUnit extends TatuModule {
                 ))
                 // (b) check A/D. If not set, trigger pagefault. Software handles.
                 val adFault = !pteReg.a || (reqReg.reqOp === MemReqOp.w && !pteReg.d)
+                // (c) align check
                 val misAligned = Mux(level === 2.U, pteReg.ppn(17, 0) =/= 0.U, Mux(
                     level === 1.U, pteReg.ppn(8, 0) =/= 0.U, false.B
                 ))
