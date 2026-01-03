@@ -43,7 +43,9 @@ class TransUnitReqBundle extends TatuBundle {
 
 class TransUnitRespBundle extends TatuBundle {
     val pa = UInt(addrWidth.W)
-    val exception = Output(UInt(PageFaultExceptType.width.W))
+    val exception = UInt(PageFaultExceptType.width.W)
+    val pte = new Sv39PTE
+    val level = UInt(2.W)
 }
 
 class TransferBundle extends TatuBundle {
@@ -125,6 +127,7 @@ class TransUnitTransfer extends AXI4LiteMasterModule {
 }
 
 class TransUnit extends TatuModule {
+    // TODO: carry pte and level to tlb
     // state machine states
     val sIdle :: sReq :: sWait :: sCheck :: sDone :: Nil = Enum(5)
 

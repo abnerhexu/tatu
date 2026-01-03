@@ -2,10 +2,8 @@ package org.shahe.tatu.chip.mmu
 
 import chisel3._
 import org.shahe.tatu.chip.common.{TatuModule, TatuBundle}
-import chisel3.util.{Decoupled, log2Ceil, Enum}
-import chisel3.util.PriorityEncoder
+import chisel3.util._
 import org.shahe.tatu.chip.csr.PrivStateType
-import chisel3.util.MuxLookup
 
 class TLBEntry extends TatuBundle {
     val vpn = UInt(27.W) // Sv39: vpn(2), vpn(1), vpn(0)
@@ -75,5 +73,78 @@ class TranslationLookupTable(val num_entries: Int = 16) extends TatuModule {
         ))
     }
 
-    
+    io.req.ready := false.B
+    io.resp.valid := false.B
+    io.resp.bits := DontCare
+
+    ptw.io.req.valid := false.B
+    ptw.io.req.bits := io.req.bits
+    ptw.io.resp.ready := false.B
+
+    val mmuDisabled = (io.satp(63, 60) === 0.U) || (io.priv === PrivStateType.machine)
+
+    switch(state) {
+        is(sIdle) {
+            when(io.req.valid) {
+                when(mmuDisabled) {
+                    // case (a): mmu not enabled, direct pa
+                    io.resp.valid := true.B
+                    io.resp.bits.pa := io.req.bits.va
+                    io.resp.bits.exception := PageFaultExceptType.success
+                    io.req.ready := io.resp.ready
+                }.elsewhen(isHit) {
+                    // case (b): tlb hit
+                    io.resp.valid := true.B
+                    io.req.ready := true.B
+
+                    io.resp.bits.pa := MuxLookup(hitEntry.level, Cat(hitEntry.ppn, io.req.bits.va(11, 0)))(Seq(
+                        2.U -> Cat(hitEntry.ppn(43, 18), io.req.bits.va(29, 0)),
+                        1.U -> Cat(hitEntry.ppn(43, 9), io.req.bits.va(20, 0)),
+                        0.U -> Cat(hitEntry.ppn, io.req.bits.va(11, 0))
+                    ))
+
+                    when(privDeny || accessDeny) {
+                        io.resp.bits.exception := throwPageFault(io.req.bits.reqOp)
+                    }.otherwise {
+                        io.resp.bits.exception := PageFaultExceptType.success
+                    }
+                }.otherwise {
+                    // case (c): tlb miss, go to ptw
+                    ptw.io.req.valid := true.B
+                    when(ptw.io.req.fire) {
+                        state := sWaitPTW
+                    }
+                }
+            }
+        }
+
+        is(sWaitPTW) {
+            ptw.io.resp.ready := io.resp.ready
+            io.resp.valid := ptw.io.resp.valid
+            io.resp.bits := ptw.io.resp.bits
+
+            when(ptw.io.resp.fire) {
+                when(ptw.io.resp.bits.exception === PageFaultExceptType.success) {
+                    val replaced = entries(replacePtr)
+                    replaced.valid := true.B
+                    replaced.vpn := io.req.bits.va(38, 12)
+                    replaced.ppn := ptw.io.resp.bits.pa(55, 12)
+                    replaced.u := ptw.io.resp.bits.pte.u
+                    replaced.r := ptw.io.resp.bits.pte.r
+                    replaced.w := ptw.io.resp.bits.pte.w
+                    replaced.x := ptw.io.resp.bits.pte.x
+                    replaced.level := ptw.io.resp.bits.level
+
+                    replacePtr := replacePtr + 1.U
+                }
+                state := sIdle
+            }
+        }
+    }
+
+    when(io.sfense) {
+        entries.foreach(_.valid := false.B)
+    }
+
+
 }
