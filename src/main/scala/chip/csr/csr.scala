@@ -4,7 +4,7 @@ import chisel3._
 import org.shahe.tatu.chip.common.TatuModule
 
 class csr {
-  
+    
 }
 
 object PrivStateType {
