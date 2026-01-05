@@ -271,8 +271,13 @@ class TransUnit extends TatuModule {
         }
 
         is(sDone) {
+            // io.resp.valid has been set in default signals section, scroll up
             io.resp.bits.pa := finalPhyaddr
             io.resp.bits.exception := exceptionType
+
+            // give PTE metadata to TLB
+            io.resp.bits.pte := pteReg
+            io.resp.bits.level := level
             when(io.resp.fire) {
                 state := sIdle
             }

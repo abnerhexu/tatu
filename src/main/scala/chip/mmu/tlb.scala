@@ -124,11 +124,12 @@ class TranslationLookupTable(val num_entries: Int = 16) extends TatuModule {
             io.resp.bits := ptw.io.resp.bits
 
             when(ptw.io.resp.fire) {
+                // only update TLB when PTW finds pagetable and no fault occurs
                 when(ptw.io.resp.bits.exception === PageFaultExceptType.success) {
                     val replaced = entries(replacePtr)
                     replaced.valid := true.B
-                    replaced.vpn := io.req.bits.va(38, 12)
-                    replaced.ppn := ptw.io.resp.bits.pa(55, 12)
+                    replaced.vpn := vpnQuery
+                    replaced.ppn := ptw.io.resp.bits.pte.ppn
                     replaced.u := ptw.io.resp.bits.pte.u
                     replaced.r := ptw.io.resp.bits.pte.r
                     replaced.w := ptw.io.resp.bits.pte.w
@@ -145,6 +146,4 @@ class TranslationLookupTable(val num_entries: Int = 16) extends TatuModule {
     when(io.sfense) {
         entries.foreach(_.valid := false.B)
     }
-
-
 }
