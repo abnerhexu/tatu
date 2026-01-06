@@ -293,3 +293,45 @@ class TransUnit extends TatuModule {
         io.xb.readData.ready := false.B
     }
 }
+
+class MMUBundle extends TatuBundle {
+    // request/response from/to CPU pipeline
+    val req = Flipped(Decoupled(new TransUnitReqBundle))
+    val resp = Decoupled(new TransUnitRespBundle)
+
+    // control signals
+    val satp = Input(UInt(dataWidth.W))
+    val priv = Input(UInt(2.W))
+    val sfense = Input(Bool())
+    val abort = Input(Bool())
+
+    // bus to axi
+    val axi = new AXI4LiteBundle
+
+}
+
+class MMU extends TatuModule {
+    val io = IO(new MMUBundle)
+    // TLB: TransUnit and PTW included
+    val tlb = Module(new TranslationLookupTable)
+    // AXI transfer module
+    val bus = Module(new TransUnitTransfer)
+
+    // connect the io between tlb and this module
+    tlb.io.req <> io.req
+    io.resp <> tlb.io.resp
+
+    tlb.io.satp := io.satp
+    tlb.io.priv := io.priv
+    tlb.io.sfense := io.sfense
+    tlb.io.abort := io.abort
+
+    // connect ptw in tlb and axi
+    bus.xio.xb <> tlb.ptw.io.xb
+
+    // abort signal to axi
+    bus.xio.abort := io.abort
+
+    // connect axi and top-axi interface
+    io.axi <> bus.io.axi
+}
